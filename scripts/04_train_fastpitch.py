@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
 """
 Step 4: Fine-tune FastPitch on Norwegian using NeMo 2.7.
-Patches: ds_class, _target_, PTL compile check for NeMo compat.
+Uses lightning.pytorch (2.4) instead of pytorch_lightning (2.6) for NeMo compat.
 """
 import os, json
 from pathlib import Path
-
-# Patch PTL 2.6 isinstance check BEFORE any imports
-# Must patch in trainer.py where it's used, not just in compile.py
-import pytorch_lightning.utilities.compile as _ptl_compile
-import pytorch_lightning.trainer.trainer as _ptl_trainer
-_ptl_compile._maybe_unwrap_optimized = lambda model: model
-_ptl_trainer._maybe_unwrap_optimized = lambda model: model
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(SCRIPT_DIR.parent / "data"))).resolve()
@@ -38,7 +31,7 @@ def main():
     print(f"  Training steps: {max_steps}")
     try:
         import torch
-        import pytorch_lightning as pl
+        import lightning.pytorch as pl
         from omegaconf import OmegaConf, open_dict
         from nemo.collections.tts.models import FastPitchModel
         from nemo.utils.exp_manager import exp_manager
