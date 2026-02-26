@@ -20,29 +20,40 @@ with tarfile.open(nemo_path, 'r:') as tar:
 ckpt_files = glob.glob(f'{tmpdir}/**/model_weights.ckpt', recursive=True)
 if not ckpt_files:
     ckpt_files = glob.glob(f'{tmpdir}/**/*.ckpt', recursive=True)
-print(f'Checkpoint: {ckpt_files}')
 saved_state = torch.load(ckpt_files[0], map_location='cuda')
 
-# Check actual embedding size from saved weights
 emb_key = 'fastpitch.encoder.word_emb.weight'
 n_tokens = saved_state[emb_key].shape[0]
 emb_dim = saved_state[emb_key].shape[1]
 print(f'Saved embedding: {n_tokens} tokens x {emb_dim} dim')
 
-# Load pretrained English model, then resize and load our weights
 from nemo.collections.tts.models import FastPitchModel, HifiGanModel
+
+# Load pretrained English FastPitch, resize embedding, load our weights
 fp = FastPitchModel.from_pretrained("nvidia/tts_en_fastpitch")
-
-# Resize embedding to match our 49 Norwegian IPA tokens
 fp.fastpitch.encoder.word_emb = torch.nn.Embedding(n_tokens, emb_dim, padding_idx=0)
-
-# Load our trained weights
 fp.load_state_dict(saved_state, strict=False)
 fp.eval().cuda()
-print(f'Model loaded! Embedding: {fp.fastpitch.encoder.word_emb.weight.shape}')
+print(f'FastPitch loaded! Embedding: {fp.fastpitch.encoder.word_emb.weight.shape}')
 
-# Load HiFi-GAN vocoder
-hg = HifiGanModel.from_pretrained('nvidia/tts_en_hifigan')
+# Load HiFi-GAN - try multiple names since some require auth
+hg = None
+for name in ["tts_en_hifigan", "tts_en_lj_hifigan_ft_mixerttsx", "tts_hifigan"]:
+    try:
+        print(f'Trying HiFi-GAN: {name}')
+        hg = HifiGanModel.from_pretrained(model_name=name)
+        print(f'HiFi-GAN loaded: {name}')
+        break
+    except Exception as e:
+        print(f'  Failed: {e}')
+
+if hg is None:
+    # Last resort: download from NGC directly
+    print('Downloading HiFi-GAN from NGC...')
+    os.system('wget -q https://api.ngc.nvidia.com/v2/models/nvidia/nemo/tts_en_lj_hifigan/versions/1.6.0/files/tts_en_lj_hifigan.nemo -O /tmp/hifigan.nemo')
+    hg = HifiGanModel.restore_from('/tmp/hifigan.nemo')
+    print('HiFi-GAN loaded from NGC')
+
 hg.eval().cuda()
 
 from phonemizer import phonemize
@@ -82,10 +93,10 @@ os.makedirs('/workspace/tts_eval', exist_ok=True)
 try:
     from f5_tts.api import F5TTS
     model = F5TTS(model_type='F5-TTS', ckpt_file='hf://akhbar/F5_Norwegian', device='cuda')
-    
+
     ref_wavs = sorted(glob.glob('/workspace/echotrail-nemo-tts/data/wavs/*.wav'))
     ref_audio = ref_wavs[0] if ref_wavs else None
-    
+
     if ref_audio:
         texts = [
             'Hei, jeg heter EchoTrail og jeg kan hjelpe deg med aa finne veien.',
@@ -121,13 +132,13 @@ try:
     import torchaudio as ta
     from chatterbox.tts import ChatterboxTTS
     from huggingface_hub import hf_hub_download
-    
+
     REPO_ID = 'akhbar/chatterbox-tts-norwegian'
     for f in ['ve.safetensors', 't3_cfg.safetensors', 's3gen.safetensors', 'tokenizer.json', 'conds.pt']:
         lp = hf_hub_download(repo_id=REPO_ID, filename=f)
-    
+
     model = ChatterboxTTS.from_local(Path(lp).parent, device='cuda')
-    
+
     texts = [
         'Hei, jeg heter EchoTrail og jeg kan hjelpe deg med aa finne veien.',
         'Det er viktig aa ta vare paa naturen rundt oss.',
