@@ -1,165 +1,102 @@
 #!/usr/bin/env python3
 """
 Step 4: Fine-tune FastPitch on Norwegian using NeMo 2.7.
-- Uses espeak-ng + phonemizer for Norwegian IPA G2P
-- Custom NorwegianG2P class wrapping phonemizer
-- IPATokenizer with Norwegian locale support
-- Embedding layer resize for new vocabulary
-- lightning.pytorch Trainer for NeMo 2.7 compat
+Uses espeak-ng + phonemizer for Norwegian IPA G2P.
+Resizes embedding layer for new IPA vocabulary.
 """
-import os, sys, json, re, string
+import os, json, string
 from pathlib import Path
-from typing import List, Optional, Callable, Union
+from typing import List, Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(SCRIPT_DIR.parent / "data"))).resolve()
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", str(SCRIPT_DIR.parent / "models"))).resolve()
 MANIFEST_DIR = DATA_DIR / "manifests"
 SUP_DATA_DIR = DATA_DIR / "sup_data"
-
 NEW_DS_CLASS = "nemo.collections.tts.data.dataset.TTSDataset"
 
 
 class NorwegianG2P:
-    """Norwegian grapheme-to-phoneme using espeak-ng via phonemizer."""
-
-    def __init__(self, phoneme_probability: Optional[float] = None):
+    def __init__(self, phoneme_probability=None):
         from phonemizer import phonemize
         from phonemizer.backend import EspeakBackend
         self.phonemize = phonemize
         self.phoneme_probability = phoneme_probability
-        # Verify Norwegian is available
         self._backend = EspeakBackend('nb', language_switch='remove-flags')
-        print("  NorwegianG2P initialized with espeak-ng 'nb' backend")
+        print("  NorwegianG2P: espeak-ng 'nb' ready")
 
-    def __call__(self, text: str) -> List[str]:
-        """Convert Norwegian text to IPA phoneme list."""
-        # Phonemize the text
-        ipa = self.phonemize(
-            text,
-            language='nb',
-            backend='espeak',
-            strip=True,
-            preserve_punctuation=True,
-            with_stress=True,
-        )
-        # Split into individual phoneme tokens
-        # IPA output uses spaces between words - we preserve word boundaries
-        tokens = []
-        for char in ipa:
-            if char == ' ':
-                tokens.append(' ')
-            elif char in string.punctuation or char in '.,!?;:':
-                tokens.append(char)
-            else:
-                tokens.append(char)
-        return tokens
+    def __call__(self, text):
+        ipa = self.phonemize(text, language='nb', backend='espeak',
+                             strip=True, preserve_punctuation=True, with_stress=True)
+        return list(ipa)
 
 
-def build_norwegian_ipa_vocab():
-    """Build IPA vocabulary from Norwegian phoneme set."""
-    # Core Norwegian IPA vowels
-    vowels = list("iɪeɛæaɑɔoʊuʉyøœəɐ")
-    # Long vowel markers
-    long_markers = ["ː"]
-    # Norwegian consonants
-    consonants = list("pbtdkɡmnŋfvsʃʂçxhrlɽjwɾ")
-    # Additional IPA symbols used in Norwegian
-    extras = ["ˈ", "ˌ", "ʰ", "ʲ", "ˑ", "̃", "̥"]
-    # Standard punctuation
-    punct = list(".,!?;:-–'\"()[] ")
-    # Digits (for numbers in text)
-    digits = list("0123456789")
-    # Special tokens
+def build_vocab():
+    ipa_chars = (
+        " .,!?;:-'\"()[]0123456789"
+        "aAbcCdDeEfghiIjklmnNoOpqrsStuvwxyz"
+        "\u00e5\u00e6\u00f8\u00c5\u00c6\u00d8"
+        "\u0250\u0251\u0252\u0253\u0254\u0255\u0256\u0258\u0259\u025a\u025b\u025c\u025e"
+        "\u025f\u0260\u0261\u0263\u0264\u0265\u0266\u0267\u0268\u026a\u026b\u026c\u026d"
+        "\u026e\u026f\u0270\u0271\u0272\u0273\u0274\u0275\u0276\u0278\u0279\u027a\u027b"
+        "\u027d\u027e\u0280\u0281\u0282\u0283\u0284\u0288\u0289\u028a\u028b\u028c\u028d"
+        "\u028e\u028f\u0290\u0291\u0292\u0294\u0295\u0298\u0299\u029b\u029c\u029d\u029f"
+        "\u02a1\u02a2\u02b0\u02b2\u02c8\u02cc\u02d0\u02d1\u02de\u02e0\u02e4"
+        "\u0303\u0306\u0308\u030b\u030c\u030f\u0318\u0319\u031a\u031c\u031d\u031e\u031f"
+        "\u0320\u0324\u0325\u032a\u032c\u032f\u0330\u0334\u0339\u033a\u033b\u033c\u033d"
+        "\u0361"
+        "\u03b2\u03b8\u03c7"
+        "\u00e7\u00f0\u0153"
+    )
     special = ["<pad>", "<blank>", "<oov>"]
-
-    all_tokens = special + sorted(set(
-        vowels + long_markers + consonants + extras + punct + digits
-    ))
+    all_tokens = special + sorted(set(ipa_chars))
     return all_tokens
 
 
-def create_norwegian_tokenizer():
-    """Create a tokenizer for Norwegian IPA phonemes."""
+def create_tokenizer():
     from nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers import BaseTokenizer
 
     class NorwegianIPATokenizer(BaseTokenizer):
-        """IPA tokenizer for Norwegian using espeak-ng."""
-
-        PAD = "<pad>"
-        BLANK = "<blank>"
-        OOV = "<oov>"
-
+        PAD, BLANK, OOV = "<pad>", "<blank>", "<oov>"
         def __init__(self, g2p=None):
-            # Build vocabulary
-            vocab = build_norwegian_ipa_vocab()
-            self.pad = vocab.index(self.PAD)
-            self.blank = vocab.index(self.BLANK) if self.BLANK in vocab else None
-            self.oov = vocab.index(self.OOV)
-
-            # Token <-> ID mappings
+            vocab = build_vocab()
+            self.pad = 0
+            self.blank = 1
+            self.oov = 2
             self._token2id = {t: i for i, t in enumerate(vocab)}
             self._id2token = {i: t for i, t in enumerate(vocab)}
             self.tokens = vocab
             self.vocab_size = len(vocab)
-
             self.g2p = g2p or NorwegianG2P()
             self.phoneme_probability = getattr(g2p, 'phoneme_probability', None)
             self.text_preprocessing_func = lambda x: x.strip()
             print(f"  NorwegianIPATokenizer: {self.vocab_size} tokens")
 
-        def encode(self, text: str) -> List[int]:
-            """Encode text to token IDs via IPA."""
-            text = self.text_preprocessing_func(text)
-            phonemes = self.g2p(text)
-            ids = []
-            for p in phonemes:
-                if p in self._token2id:
-                    ids.append(self._token2id[p])
-                else:
-                    ids.append(self.oov)
-            return ids
+        def encode(self, text):
+            phonemes = self.g2p(self.text_preprocessing_func(text))
+            return [self._token2id.get(p, self.oov) for p in phonemes]
 
-        def decode(self, ids: List[int]) -> str:
+        def decode(self, ids):
             return "".join(self._id2token.get(i, "?") for i in ids)
 
     return NorwegianIPATokenizer()
 
 
 def resize_embeddings(model, new_vocab_size):
-    """Resize FastPitch text encoder embedding layer for new vocabulary."""
-    import torch
-    import torch.nn as nn
-
-    # Find the text embedding layer
+    import torch, torch.nn as nn
     old_emb = model.fastpitch.encoder.word_emb
-    old_vocab_size, emb_dim = old_emb.weight.shape
-    print(f"  Resizing embeddings: {old_vocab_size} -> {new_vocab_size} (dim={emb_dim})")
-
-    if new_vocab_size == old_vocab_size:
-        print("  No resize needed")
-        return
-
-    # Create new embedding layer
-    new_emb = nn.Embedding(new_vocab_size, emb_dim, padding_idx=old_emb.padding_idx)
-
-    # Initialize with small random values
+    old_vs, dim = old_emb.weight.shape
+    print(f"  Resize embedding: {old_vs} -> {new_vocab_size} (dim={dim})")
+    new_emb = nn.Embedding(new_vocab_size, dim, padding_idx=0)
     nn.init.normal_(new_emb.weight, mean=0.0, std=0.02)
-
-    # Copy over existing weights where possible
-    copy_size = min(old_vocab_size, new_vocab_size)
     with torch.no_grad():
-        new_emb.weight[:copy_size] = old_emb.weight[:copy_size]
-
-    # Replace the embedding layer
+        new_emb.weight[0].zero_()
     model.fastpitch.encoder.word_emb = new_emb
-    print(f"  Embedding resized successfully")
-
-    # Also update the model config
     from omegaconf import open_dict
     with open_dict(model.cfg):
-        model.cfg.symbols_embedding_dim = emb_dim
+        model.cfg.symbols_embedding_dim = dim
         model.cfg.n_symbols = new_vocab_size
+    print(f"  Embedding resized OK")
 
 
 def main():
@@ -174,9 +111,9 @@ def main():
     with open(train_manifest) as f:
         entries = [json.loads(l) for l in f]
     total_dur = sum(e["duration"] for e in entries)
-    print(f"  Training data: {len(entries)} utterances, {total_dur/60:.1f} min")
+    print(f"  Data: {len(entries)} utts, {total_dur/60:.1f} min")
     max_steps = max(3000, min(10000, int(total_dur / 60 * 100)))
-    print(f"  Training steps: {max_steps}")
+    print(f"  Max steps: {max_steps}")
 
     try:
         import torch
@@ -188,29 +125,20 @@ def main():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"  Device: {device}")
 
-        # 1. Create Norwegian tokenizer
         print("Creating Norwegian IPA tokenizer")
-        g2p = NorwegianG2P()
-        tokenizer = create_norwegian_tokenizer()
-        print(f"  Vocab size: {tokenizer.vocab_size}")
+        tokenizer = create_tokenizer()
 
-        # Test tokenizer
-        test_text = "Hei dette er en test"
-        test_ids = tokenizer.encode(test_text)
-        print(f"  Test: '{test_text}' -> {len(test_ids)} tokens")
+        test_ids = tokenizer.encode("Hei dette er en test")
+        print(f"  Test encode: {len(test_ids)} tokens")
 
-        # 2. Load pretrained model
-        print("Loading pretrained FastPitch (English)")
+        print("Loading pretrained FastPitch")
         model = FastPitchModel.from_pretrained("tts_en_fastpitch")
 
-        # 3. Replace tokenizer and resize embeddings
-        print("Replacing tokenizer with Norwegian IPA")
+        print("Patching model for Norwegian")
         model.vocab = tokenizer
         model.ds_class = NEW_DS_CLASS
         resize_embeddings(model, tokenizer.vocab_size)
 
-        # 4. Configure for Norwegian data
-        print("Configuring for Norwegian data")
         abs_train = str(train_manifest)
         abs_val = str(val_manifest)
         abs_sup = str(SUP_DATA_DIR)
@@ -234,23 +162,16 @@ def main():
             model.cfg.optim.name = "adam"
             model.cfg.optim.weight_decay = 1e-6
 
-        # 5. Setup data loaders
-        print("Setting up data loaders")
+        print("Setup data loaders")
         model.setup_training_data(model.cfg.train_ds)
         model.setup_validation_data(model.cfg.validation_ds)
-        print("  Data loaders configured")
 
-        # 6. Create trainer
-        print(f"Starting training ({max_steps} steps)")
+        print(f"Training ({max_steps} steps)")
         trainer = pl.Trainer(
-            devices=1,
-            accelerator="gpu" if device == "cuda" else "cpu",
-            max_steps=max_steps,
-            check_val_every_n_epoch=1,
-            log_every_n_steps=50,
-            enable_checkpointing=False,
-            logger=False,
-            default_root_dir=str(MODEL_DIR / "fastpitch_logs"),
+            devices=1, accelerator="gpu" if device == "cuda" else "cpu",
+            max_steps=max_steps, check_val_every_n_epoch=1,
+            log_every_n_steps=50, enable_checkpointing=False,
+            logger=False, default_root_dir=str(MODEL_DIR / "fastpitch_logs"),
         )
         exp_cfg = {
             "exp_dir": str(MODEL_DIR / "fastpitch_logs"),
@@ -258,29 +179,21 @@ def main():
             "create_tensorboard_logger": True,
             "create_wandb_logger": False,
             "checkpoint_callback_params": {
-                "monitor": "val_loss",
-                "mode": "min",
-                "save_top_k": 3,
-                "save_last": True,
+                "monitor": "val_loss", "mode": "min",
+                "save_top_k": 3, "save_last": True,
             },
         }
         exp_manager(trainer, OmegaConf.create(exp_cfg))
         model.set_trainer(trainer)
         trainer.fit(model)
 
-        # 7. Save model
         output_path = MODEL_DIR / "norwegian_fastpitch.nemo"
         model.save_to(str(output_path))
-        print(f"FastPitch saved to {output_path}")
-        print(f"  Size: {output_path.stat().st_size / 1024 / 1024:.1f} MB")
+        print(f"Saved: {output_path} ({output_path.stat().st_size/1024/1024:.1f} MB)")
 
-    except ImportError as e:
-        print(f"NeMo not available: {e}")
-        import traceback; traceback.print_exc()
     except Exception as e:
         print(f"Training failed: {e}")
         import traceback; traceback.print_exc()
-
 
 if __name__ == "__main__":
     main()
