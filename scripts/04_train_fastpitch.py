@@ -79,7 +79,7 @@ def main():
             max_steps=max_steps,
             check_val_every_n_epoch=1,
             log_every_n_steps=50,
-            enable_checkpointing=True,
+            enable_checkpointing=False,
             logger=False,
             default_root_dir=str(MODEL_DIR / "fastpitch_logs"),
         )
