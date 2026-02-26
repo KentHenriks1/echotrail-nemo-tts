@@ -2,7 +2,7 @@
 """
 Step 4: Fine-tune FastPitch on Norwegian using NeMo 2.7.
 Uses pre-processed IPA manifests (from step 03).
-Optimized for H100 80GB: batch_size=64, num_workers=8, pin_memory.
+Optimized for H100 80GB: batch_size=64, num_workers=8, bf16-mixed.
 """
 import os, json
 from pathlib import Path
@@ -92,20 +92,20 @@ def main():
         from nemo.utils.exp_manager import exp_manager
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1e9 if device == "cuda" else 0
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9 if device == "cuda" else 0
         print(f"  Device: {device} ({gpu_mem:.0f} GB)")
 
         # Determine optimal batch size for GPU
         if gpu_mem >= 70:
-            batch_size = 64      # H100 80GB
+            batch_size = 64
             val_batch = 32
             workers = 8
         elif gpu_mem >= 30:
-            batch_size = 32      # A100 40GB
+            batch_size = 32
             val_batch = 16
             workers = 4
         else:
-            batch_size = 16      # smaller GPUs
+            batch_size = 16
             val_batch = 8
             workers = 2
         print(f"  Batch size: {batch_size}, workers: {workers}")
@@ -139,7 +139,6 @@ def main():
             model.cfg.validation_ds.dataset.manifest_filepath = abs_val
             model.cfg.validation_ds.dataset.sup_data_path = abs_sup
             model.cfg.validation_ds.manifest_filepath = abs_val
-            # H100-optimized params
             model.cfg.train_ds.batch_size = batch_size
             model.cfg.validation_ds.batch_size = val_batch
             model.cfg.train_ds.dataloader_params.num_workers = workers
@@ -150,7 +149,6 @@ def main():
             model.cfg.validation_ds.dataloader_params.persistent_workers = True
             model.cfg.sup_data_path = abs_sup
             model.cfg.sup_data_types = ["align_prior_matrix", "pitch"]
-            # Optimizer — higher LR with warmup works better with large batch
             model.cfg.optim.lr = 2e-4
             model.cfg.optim.name = "adam"
             model.cfg.optim.weight_decay = 1e-6
@@ -161,7 +159,7 @@ def main():
         model.setup_validation_data(model.cfg.validation_ds)
 
         # 5. Train
-        print(f"Training ({max_steps} steps, batch={batch_size})")
+        print(f"Training ({max_steps} steps, batch={batch_size}, bf16)")
         trainer = pl.Trainer(
             devices=1,
             accelerator="gpu" if device == "cuda" else "cpu",
@@ -170,7 +168,7 @@ def main():
             log_every_n_steps=50,
             enable_checkpointing=False,
             logger=False,
-            precision="bf16-mixed",  # BF16 for H100 — 2x throughput
+            precision="bf16-mixed",
             default_root_dir=str(MODEL_DIR / "fastpitch_logs"),
         )
         exp_cfg = {
