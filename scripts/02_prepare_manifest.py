@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Step 2: Parse NST HuggingFace JSON metadata + extracted MP3 audio into NeMo manifests.
-NST format: JSONL with {text, Speaker_ID, Region_of_Youth, Sex, file, t0, t1, t2, ...}
-Audio: MP3 files extracted from tar.gz shards into data/nst/
+
+NST HuggingFace naming: {pid}_{file_stem}.mp3
+  Example: no99x069-22071999-1425_u0070005.mp3
+  JSON has: pid="no99x069-22071999-1425", file="u0070005.wav"
 """
-import os, json, random, re, glob
+import os, json, random, re
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
@@ -14,12 +16,12 @@ TARGET_SR = 22050
 
 def clean_text(text):
     """Clean NST transcription text: remove markup like \\Komma \\Punktum etc."""
-    text = re.sub(r'\\[A-Za-zæøåÆØÅ]+', '', text)  # Remove \Komma \Punktum etc
+    text = re.sub(r'\\[A-Za-zæøåÆØÅ]+', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 def load_nst_metadata(data_dir):
-    """Load all NST JSON metadata shards and match with extracted audio files."""
+    """Load NST JSON metadata and match with extracted MP3 files."""
     import soundfile as sf
     entries = []
     nst_dir = data_dir / "nst"
@@ -27,23 +29,25 @@ def load_nst_metadata(data_dir):
         print(f"  {nst_dir} not found")
         return entries
 
-    # Find all audio files (MP3 from tar.gz extraction)
+    # Index all audio files by their full filename (without extension)
     audio_files = {}
-    for ext in ["*.mp3", "*.wav"]:
-        for f in nst_dir.rglob(ext):
-            audio_files[f.name] = str(f)
-            # Also index without extension
-            audio_files[f.stem] = str(f)
-    print(f"  Found {len(audio_files)//2} audio files")
+    for f in nst_dir.rglob("*.mp3"):
+        audio_files[f.stem] = str(f)
+    for f in nst_dir.rglob("*.wav"):
+        audio_files[f.stem] = str(f)
+    print(f"  Found {len(audio_files)} audio files")
 
     # Load JSON metadata shards
     json_files = sorted(nst_dir.glob("nst_no_train_close-*.json"))
     if not json_files:
-        # Try JSONL from Sprakbanken
         jsonl = nst_dir / "nst_tts_dataset.jsonl"
         if jsonl.exists():
             json_files = [jsonl]
     print(f"  Found {len(json_files)} metadata files")
+
+    matched = 0
+    skipped_no_audio = 0
+    skipped_text = 0
 
     for jf in json_files:
         with open(jf, "r", encoding="utf-8") as f:
@@ -58,27 +62,36 @@ def load_nst_metadata(data_dir):
 
                 text = clean_text(rec.get("text", ""))
                 if not text or len(text) < 5:
+                    skipped_text += 1
                     continue
 
-                # Find audio file - try multiple name patterns
+                # Build expected filename: {pid}_{file_stem}
+                pid = rec.get("pid", "")
+                raw_file = rec.get("file", "")
+                file_stem = Path(raw_file).stem if raw_file else ""
+
                 audio_path = None
-                for key in [rec.get("file", ""), rec.get("channel_1", "")]:
-                    if not key:
-                        continue
-                    basename = Path(key).name
-                    stem = Path(key).stem
-                    # Try exact name, then stem with .mp3
-                    for lookup in [basename, stem, f"{stem}.mp3", f"{stem}.wav"]:
-                        if lookup in audio_files:
-                            audio_path = audio_files[lookup]
-                            break
-                    if audio_path:
-                        break
+                # Try: {pid}_{file_stem} (HuggingFace naming)
+                if pid and file_stem:
+                    lookup = f"{pid}_{file_stem}"
+                    if lookup in audio_files:
+                        audio_path = audio_files[lookup]
+                # Fallback: just file_stem
+                if not audio_path and file_stem:
+                    if file_stem in audio_files:
+                        audio_path = audio_files[file_stem]
+                # Fallback for channel_1 format (Sprakbanken TTS)
+                if not audio_path:
+                    ch1 = rec.get("channel_1", "")
+                    if ch1:
+                        ch1_stem = Path(ch1).stem
+                        if ch1_stem in audio_files:
+                            audio_path = audio_files[ch1_stem]
 
                 if not audio_path:
+                    skipped_no_audio += 1
                     continue
 
-                # Get duration from audio file
                 try:
                     info = sf.info(audio_path)
                     duration = info.duration
@@ -96,7 +109,9 @@ def load_nst_metadata(data_dir):
                     "region": rec.get("Region_of_Youth", "unknown"),
                     "sex": rec.get("Sex", "unknown"),
                 })
+                matched += 1
 
+    print(f"  Matched: {matched}, skipped (no audio): {skipped_no_audio}, skipped (text): {skipped_text}")
     return entries
 
 def convert_to_wav(entries):
@@ -105,7 +120,8 @@ def convert_to_wav(entries):
     wav_dir = DATA_DIR / "nst" / "wavs_22k"
     wav_dir.mkdir(parents=True, exist_ok=True)
     converted = 0
-    for entry in entries:
+    failed = 0
+    for i, entry in enumerate(entries):
         src = entry["audio_filepath"]
         stem = Path(src).stem
         dst = wav_dir / f"{stem}.wav"
@@ -114,11 +130,14 @@ def convert_to_wav(entries):
                 audio, sr = librosa.load(src, sr=TARGET_SR)
                 sf.write(str(dst), audio, TARGET_SR)
                 converted += 1
-            except Exception:
+            except Exception as e:
+                failed += 1
                 continue
         entry["audio_filepath"] = str(dst)
         entry["original_sr"] = TARGET_SR
-    print(f"  Converted {converted} files to {TARGET_SR}Hz WAV")
+        if (i + 1) % 5000 == 0:
+            print(f"    Progress: {i+1}/{len(entries)} converted")
+    print(f"  Converted {converted} files to {TARGET_SR}Hz WAV ({failed} failed)")
 
 def write_manifest(entries, name):
     MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
@@ -153,6 +172,9 @@ def main():
     print("\nConverting to 22050Hz WAV...")
     convert_to_wav(entries)
 
+    # Filter out entries where WAV doesn't exist (failed conversions)
+    entries = [e for e in entries if Path(e["audio_filepath"]).exists()]
+
     # Shuffle and split
     random.seed(42)
     random.shuffle(entries)
@@ -163,7 +185,7 @@ def main():
     write_manifest(entries[:split], "norwegian_train")
     write_manifest(entries[split:], "norwegian_val")
 
-    # Also create single-speaker subset (best speaker)
+    # Single-speaker subset
     speaker_counts = {}
     for e in entries:
         sid = e["speaker_id"]
