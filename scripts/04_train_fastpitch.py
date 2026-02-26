@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Step 4: Fine-tune FastPitch on Norwegian using NeMo 2.7.
-Fixes _target_ path for TTSDataset (moved in NeMo 2.x).
+Patches module path alias for TTSDataset (moved in NeMo 2.x).
 """
-import os, json
+import os, sys, json, types
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
@@ -11,6 +11,21 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", str(SCRIPT_DIR.parent / "data")))
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", str(SCRIPT_DIR.parent / "models")))
 MANIFEST_DIR = DATA_DIR / "manifests"
 SUP_DATA_DIR = DATA_DIR / "sup_data"
+
+def patch_nemo_module_paths():
+    """Create module alias so old config _target_ paths resolve correctly."""
+    try:
+        import nemo.collections.tts.data.dataset as new_mod
+        # Create the old module path as alias
+        parent_path = "nemo.collections.tts.torch"
+        data_path = "nemo.collections.tts.torch.data"
+        if parent_path not in sys.modules:
+            sys.modules[parent_path] = types.ModuleType(parent_path)
+        if data_path not in sys.modules:
+            sys.modules[data_path] = new_mod
+        print("  Patched module path: tts.torch.data -> tts.data.dataset")
+    except ImportError:
+        pass
 
 def main():
     print("Step 4: Fine-tune FastPitch on Norwegian")
@@ -30,9 +45,13 @@ def main():
     try:
         import torch
         import pytorch_lightning as pl
+        from omegaconf import OmegaConf, open_dict
+
+        # Patch module paths BEFORE loading the model
+        patch_nemo_module_paths()
+
         from nemo.collections.tts.models import FastPitchModel
         from nemo.utils.exp_manager import exp_manager
-        from omegaconf import OmegaConf, open_dict
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"  Device: {device}")
@@ -43,28 +62,12 @@ def main():
 
         print("Configuring for Norwegian")
         with open_dict(model.cfg):
-            # Fix dataset _target_ for NeMo 2.x (moved from .torch.data to .data.dataset)
-            if hasattr(model.cfg, 'train_ds') and hasattr(model.cfg.train_ds, 'dataset'):
-                if hasattr(model.cfg.train_ds.dataset, '_target_'):
-                    old_target = model.cfg.train_ds.dataset._target_
-                    if 'torch.data' in old_target:
-                        new_target = old_target.replace('torch.data', 'data.dataset')
-                        model.cfg.train_ds.dataset._target_ = new_target
-                        print(f"  Fixed train dataset target: {new_target}")
-            if hasattr(model.cfg, 'validation_ds') and hasattr(model.cfg.validation_ds, 'dataset'):
-                if hasattr(model.cfg.validation_ds.dataset, '_target_'):
-                    old_target = model.cfg.validation_ds.dataset._target_
-                    if 'torch.data' in old_target:
-                        new_target = old_target.replace('torch.data', 'data.dataset')
-                        model.cfg.validation_ds.dataset._target_ = new_target
-                        print(f"  Fixed val dataset target: {new_target}")
-
             model.cfg.train_ds.manifest_filepath = str(train_manifest)
             model.cfg.validation_ds.manifest_filepath = str(val_manifest)
             model.cfg.train_ds.batch_size = 16
             model.cfg.validation_ds.batch_size = 8
-            model.cfg.train_ds.num_workers = 4
-            model.cfg.validation_ds.num_workers = 2
+            model.cfg.train_ds.dataloader_params.num_workers = 4
+            model.cfg.validation_ds.dataloader_params.num_workers = 2
             model.cfg.sup_data_path = str(SUP_DATA_DIR)
             model.cfg.sup_data_types = ["align_prior_matrix", "pitch"]
             model.cfg.optim.lr = 1e-4
