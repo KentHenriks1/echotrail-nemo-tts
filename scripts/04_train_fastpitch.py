@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Step 4: Fine-tune FastPitch on Norwegian using NeMo 2.7.
-Patches module path alias for TTSDataset (moved in NeMo 2.x).
+Patches: ds_class + module alias for TTSDataset (moved in NeMo 2.x).
 """
 import os, sys, json, types
 from pathlib import Path
@@ -12,18 +12,15 @@ MODEL_DIR = Path(os.environ.get("MODEL_DIR", str(SCRIPT_DIR.parent / "models")))
 MANIFEST_DIR = DATA_DIR / "manifests"
 SUP_DATA_DIR = DATA_DIR / "sup_data"
 
+NEW_DS_CLASS = "nemo.collections.tts.data.dataset.TTSDataset"
+
 def patch_nemo_module_paths():
     """Create module alias so old config _target_ paths resolve correctly."""
     try:
         import nemo.collections.tts.data.dataset as new_mod
-        # Create the old module path as alias
-        parent_path = "nemo.collections.tts.torch"
-        data_path = "nemo.collections.tts.torch.data"
-        if parent_path not in sys.modules:
-            sys.modules[parent_path] = types.ModuleType(parent_path)
-        if data_path not in sys.modules:
-            sys.modules[data_path] = new_mod
-        print("  Patched module path: tts.torch.data -> tts.data.dataset")
+        for path in ["nemo.collections.tts.torch", "nemo.collections.tts.torch.data"]:
+            if path not in sys.modules:
+                sys.modules[path] = new_mod if path.endswith('.data') else types.ModuleType(path)
     except ImportError:
         pass
 
@@ -47,7 +44,6 @@ def main():
         import pytorch_lightning as pl
         from omegaconf import OmegaConf, open_dict
 
-        # Patch module paths BEFORE loading the model
         patch_nemo_module_paths()
 
         from nemo.collections.tts.models import FastPitchModel
@@ -58,10 +54,16 @@ def main():
 
         print("Loading pretrained FastPitch (English)")
         model = FastPitchModel.from_pretrained("tts_en_fastpitch")
-        print("  Pretrained model loaded")
+
+        # Patch ds_class so NeMo's __setup_dataloader_from_config injects text_tokenizer
+        old_ds = model.ds_class
+        model.ds_class = NEW_DS_CLASS
+        print(f"  Patched ds_class: {old_ds} -> {NEW_DS_CLASS}")
 
         print("Configuring for Norwegian")
         with open_dict(model.cfg):
+            model.cfg.train_ds.dataset._target_ = NEW_DS_CLASS
+            model.cfg.validation_ds.dataset._target_ = NEW_DS_CLASS
             model.cfg.train_ds.manifest_filepath = str(train_manifest)
             model.cfg.validation_ds.manifest_filepath = str(val_manifest)
             model.cfg.train_ds.batch_size = 16
