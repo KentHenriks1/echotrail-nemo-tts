@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Step 4: Fine-tune FastPitch on Norwegian using NeMo's native training API.
-Uses model.setup_training_data() / setup_validation_data() + NeMo Trainer.
+Step 4: Fine-tune FastPitch on Norwegian using NeMo 2.7.
+Fixes _target_ path for TTSDataset (moved in NeMo 2.x).
 """
 import os, json
 from pathlib import Path
@@ -29,11 +29,10 @@ def main():
     print(f"  Training steps: {max_steps}")
     try:
         import torch
+        import pytorch_lightning as pl
         from nemo.collections.tts.models import FastPitchModel
         from nemo.utils.exp_manager import exp_manager
-        from nemo.core.config import hydra_runner
         from omegaconf import OmegaConf, open_dict
-        import nemo.core as nemo_core
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"  Device: {device}")
@@ -44,6 +43,22 @@ def main():
 
         print("Configuring for Norwegian")
         with open_dict(model.cfg):
+            # Fix dataset _target_ for NeMo 2.x (moved from .torch.data to .data.dataset)
+            if hasattr(model.cfg, 'train_ds') and hasattr(model.cfg.train_ds, 'dataset'):
+                if hasattr(model.cfg.train_ds.dataset, '_target_'):
+                    old_target = model.cfg.train_ds.dataset._target_
+                    if 'torch.data' in old_target:
+                        new_target = old_target.replace('torch.data', 'data.dataset')
+                        model.cfg.train_ds.dataset._target_ = new_target
+                        print(f"  Fixed train dataset target: {new_target}")
+            if hasattr(model.cfg, 'validation_ds') and hasattr(model.cfg.validation_ds, 'dataset'):
+                if hasattr(model.cfg.validation_ds.dataset, '_target_'):
+                    old_target = model.cfg.validation_ds.dataset._target_
+                    if 'torch.data' in old_target:
+                        new_target = old_target.replace('torch.data', 'data.dataset')
+                        model.cfg.validation_ds.dataset._target_ = new_target
+                        print(f"  Fixed val dataset target: {new_target}")
+
             model.cfg.train_ds.manifest_filepath = str(train_manifest)
             model.cfg.validation_ds.manifest_filepath = str(val_manifest)
             model.cfg.train_ds.batch_size = 16
@@ -58,10 +73,9 @@ def main():
 
         model.setup_training_data(model.cfg.train_ds)
         model.setup_validation_data(model.cfg.validation_ds)
+        print("  Data loaders configured")
 
         print("Starting training")
-        # Use NeMo's ptl trainer
-        import pytorch_lightning as pl
         trainer = pl.Trainer(
             devices=1,
             accelerator="gpu" if device == "cuda" else "cpu",
@@ -85,8 +99,6 @@ def main():
             },
         }
         exp_manager(trainer, OmegaConf.create(exp_cfg))
-
-        # NeMo models need to be set as the trainer's model
         model.set_trainer(trainer)
         trainer.fit(model)
 
