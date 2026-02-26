@@ -111,8 +111,6 @@ def main():
 
         # 2. Create char-level tokenizer (no runtime G2P)
         tokenizer = create_tokenizer(vocab)
-        test_ids = tokenizer.encode("hˈɑɪ dˌɛtːɑ")
-        print(f"  Test encode: {len(test_ids)} tokens, oov={sum(1 for t in test_ids if t == 2)}")
 
         # 3. Load pretrained model
         print("Loading pretrained FastPitch")
@@ -139,15 +137,16 @@ def main():
             model.cfg.validation_ds.manifest_filepath = abs_val
             model.cfg.train_ds.batch_size = 16
             model.cfg.validation_ds.batch_size = 8
-            model.cfg.train_ds.dataloader_params.num_workers = 0
-            model.cfg.validation_ds.dataloader_params.num_workers = 0
+            # Use workers=4 — IPA is pre-processed, no espeak at runtime
+            model.cfg.train_ds.dataloader_params.num_workers = 4
+            model.cfg.validation_ds.dataloader_params.num_workers = 2
             model.cfg.sup_data_path = abs_sup
             model.cfg.sup_data_types = ["align_prior_matrix", "pitch"]
             model.cfg.optim.lr = 1e-4
             model.cfg.optim.name = "adam"
             model.cfg.optim.weight_decay = 1e-6
 
-        # 5. Setup data (IPA text already in manifest — no G2P needed)
+        # 5. Setup data (IPA text already in manifest)
         print("Setup data loaders (IPA pre-processed)")
         model.setup_training_data(model.cfg.train_ds)
         model.setup_validation_data(model.cfg.validation_ds)
