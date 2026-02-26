@@ -5,8 +5,10 @@ Step 2: Parse NST HuggingFace JSON metadata + extracted MP3 audio into NeMo mani
 NST HuggingFace naming: {pid}_{file_stem}.mp3
   Example: no99x069-22071999-1425_u0070005.mp3
   JSON has: pid="no99x069-22071999-1425", file="u0070005.wav"
+
+Uses mutagen for fast MP3 duration reading (header-only, ~1ms per file).
 """
-import os, json, random, re
+import os, json, random, re, time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
@@ -20,22 +22,40 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+def get_mp3_duration(path):
+    """Get MP3 duration using mutagen (fast, header-only)."""
+    try:
+        from mutagen.mp3 import MP3
+        return MP3(path).info.length
+    except Exception:
+        return None
+
+def get_audio_duration(path):
+    """Get audio duration - MP3 via mutagen, WAV via soundfile."""
+    if path.endswith('.mp3'):
+        return get_mp3_duration(path)
+    try:
+        import soundfile as sf
+        return sf.info(path).duration
+    except Exception:
+        return None
+
 def load_nst_metadata(data_dir):
     """Load NST JSON metadata and match with extracted MP3 files."""
-    import soundfile as sf
     entries = []
     nst_dir = data_dir / "nst"
     if not nst_dir.exists():
         print(f"  {nst_dir} not found")
         return entries
 
-    # Index all audio files by their full filename (without extension)
+    # Index all audio files by stem
+    t0 = time.time()
     audio_files = {}
     for f in nst_dir.rglob("*.mp3"):
         audio_files[f.stem] = str(f)
     for f in nst_dir.rglob("*.wav"):
         audio_files[f.stem] = str(f)
-    print(f"  Found {len(audio_files)} audio files")
+    print(f"  Found {len(audio_files)} audio files ({time.time()-t0:.1f}s)")
 
     # Load JSON metadata shards
     json_files = sorted(nst_dir.glob("nst_no_train_close-*.json"))
@@ -48,8 +68,11 @@ def load_nst_metadata(data_dir):
     matched = 0
     skipped_no_audio = 0
     skipped_text = 0
+    skipped_duration = 0
+    t1 = time.time()
 
     for jf in json_files:
+        print(f"  Processing {jf.name}...")
         with open(jf, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -71,16 +94,13 @@ def load_nst_metadata(data_dir):
                 file_stem = Path(raw_file).stem if raw_file else ""
 
                 audio_path = None
-                # Try: {pid}_{file_stem} (HuggingFace naming)
                 if pid and file_stem:
                     lookup = f"{pid}_{file_stem}"
                     if lookup in audio_files:
                         audio_path = audio_files[lookup]
-                # Fallback: just file_stem
                 if not audio_path and file_stem:
                     if file_stem in audio_files:
                         audio_path = audio_files[file_stem]
-                # Fallback for channel_1 format (Sprakbanken TTS)
                 if not audio_path:
                     ch1 = rec.get("channel_1", "")
                     if ch1:
@@ -92,26 +112,27 @@ def load_nst_metadata(data_dir):
                     skipped_no_audio += 1
                     continue
 
-                try:
-                    info = sf.info(audio_path)
-                    duration = info.duration
-                    if duration < 0.5 or duration > 30.0:
-                        continue
-                except Exception:
+                duration = get_audio_duration(audio_path)
+                if duration is None or duration < 0.5 or duration > 30.0:
+                    skipped_duration += 1
                     continue
 
                 entries.append({
                     "audio_filepath": audio_path,
                     "text": text,
                     "duration": round(duration, 3),
-                    "original_sr": info.samplerate,
+                    "original_sr": 16000,
                     "speaker_id": rec.get("Speaker_ID", "unknown"),
                     "region": rec.get("Region_of_Youth", "unknown"),
                     "sex": rec.get("Sex", "unknown"),
                 })
                 matched += 1
 
-    print(f"  Matched: {matched}, skipped (no audio): {skipped_no_audio}, skipped (text): {skipped_text}")
+                if matched % 10000 == 0:
+                    print(f"    {matched} matched so far...")
+
+    elapsed = time.time() - t1
+    print(f"  Matched: {matched}, no_audio: {skipped_no_audio}, bad_text: {skipped_text}, bad_dur: {skipped_duration} ({elapsed:.1f}s)")
     return entries
 
 def convert_to_wav(entries):
@@ -121,23 +142,32 @@ def convert_to_wav(entries):
     wav_dir.mkdir(parents=True, exist_ok=True)
     converted = 0
     failed = 0
+    skipped = 0
+    t0 = time.time()
     for i, entry in enumerate(entries):
         src = entry["audio_filepath"]
         stem = Path(src).stem
         dst = wav_dir / f"{stem}.wav"
-        if not dst.exists():
+        if dst.exists():
+            entry["audio_filepath"] = str(dst)
+            entry["original_sr"] = TARGET_SR
+            skipped += 1
+        else:
             try:
                 audio, sr = librosa.load(src, sr=TARGET_SR)
                 sf.write(str(dst), audio, TARGET_SR)
+                entry["audio_filepath"] = str(dst)
+                entry["original_sr"] = TARGET_SR
                 converted += 1
-            except Exception as e:
+            except Exception:
                 failed += 1
-                continue
-        entry["audio_filepath"] = str(dst)
-        entry["original_sr"] = TARGET_SR
         if (i + 1) % 5000 == 0:
-            print(f"    Progress: {i+1}/{len(entries)} converted")
-    print(f"  Converted {converted} files to {TARGET_SR}Hz WAV ({failed} failed)")
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed
+            eta = (len(entries) - i - 1) / rate
+            print(f"    Progress: {i+1}/{len(entries)} ({rate:.0f}/s, ETA {eta:.0f}s)")
+    elapsed = time.time() - t0
+    print(f"  Done: {converted} converted, {skipped} cached, {failed} failed ({elapsed:.1f}s)")
 
 def write_manifest(entries, name):
     MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
@@ -172,7 +202,7 @@ def main():
     print("\nConverting to 22050Hz WAV...")
     convert_to_wav(entries)
 
-    # Filter out entries where WAV doesn't exist (failed conversions)
+    # Filter out entries where WAV doesn't exist
     entries = [e for e in entries if Path(e["audio_filepath"]).exists()]
 
     # Shuffle and split
