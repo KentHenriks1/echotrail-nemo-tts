@@ -3,28 +3,63 @@
 set -e
 
 echo "=== Step 1: Fix torchvision ==="
-# Get PyTorch version and reinstall matching torchvision
 TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
 echo "PyTorch version: $TORCH_VERSION"
 CUDA_VERSION=$(python3 -c "import torch; print(torch.version.cuda)")
 echo "CUDA version: $CUDA_VERSION"
-
-# Reinstall torchvision matching current PyTorch
 pip install --force-reinstall torchvision --index-url https://download.pytorch.org/whl/cu124 2>&1 | tail -3
 
 echo ""
 echo "=== Step 2: Test FastPitch inference ==="
 python3 -c "
-import torch, os, soundfile as sf
-from nemo.collections.tts.models import FastPitchModel, HifiGanModel
-from phonemizer import phonemize
-
+import torch, os, soundfile as sf, time
 os.makedirs('/workspace/tts_eval', exist_ok=True)
 
-fp = FastPitchModel.restore_from('/workspace/echotrail-nemo-tts/models/norwegian_fastpitch.nemo')
+# Load model - handle embedding size mismatch (49 IPA tokens vs 115 default)
+from nemo.collections.tts.models import FastPitchModel, HifiGanModel
+from omegaconf import OmegaConf
+import tempfile, tarfile
+
+nemo_path = '/workspace/echotrail-nemo-tts/models/norwegian_fastpitch.nemo'
+
+# Extract .nemo to get config and weights
+tmpdir = tempfile.mkdtemp()
+with tarfile.open(nemo_path, 'r:') as tar:
+    tar.extractall(tmpdir)
+
+# Find config file
+import glob
+cfg_files = glob.glob(f'{tmpdir}/**/model_config.yaml', recursive=True)
+if not cfg_files:
+    cfg_files = glob.glob(f'{tmpdir}/**/*.yaml', recursive=True)
+print(f'Config files found: {cfg_files}')
+
+# Load config and create model with correct embedding size
+cfg = OmegaConf.load(cfg_files[0])
+
+# Patch the target class for NeMo 2.7 compat
+if hasattr(cfg, 'dataset'):
+    if hasattr(cfg.dataset, '_target_'):
+        cfg.dataset._target_ = 'nemo.collections.tts.data.dataset.TTSDataset'
+
+fp = FastPitchModel(cfg)
 fp.eval().cuda()
+
+# Load state dict
+ckpt_files = glob.glob(f'{tmpdir}/**/model_weights.ckpt', recursive=True)
+if not ckpt_files:
+    ckpt_files = glob.glob(f'{tmpdir}/**/*.ckpt', recursive=True)
+print(f'Checkpoint files found: {ckpt_files}')
+
+state_dict = torch.load(ckpt_files[0], map_location='cuda')
+fp.load_state_dict(state_dict, strict=False)
+print(f'Loaded weights. Embedding shape: {fp.fastpitch.encoder.word_emb.weight.shape}')
+
+# Load HiFi-GAN vocoder
 hg = HifiGanModel.from_pretrained('nvidia/tts_en_hifigan')
 hg.eval().cuda()
+
+from phonemizer import phonemize
 
 texts = [
     'Hei, jeg heter EchoTrail og jeg kan hjelpe deg med aa finne veien.',
@@ -34,7 +69,6 @@ texts = [
     'Denne setningen tester om modellen haandterer lengre tekst med flere ord og naturlig prosodi.',
 ]
 
-import time
 for i, text in enumerate(texts):
     ipa = phonemize(text, language='nb', backend='espeak', strip=True, preserve_punctuation=True, language_switch='remove-flags')
     print(f'Text: {text}')
@@ -88,6 +122,8 @@ try:
     print('F5-TTS DONE')
 except Exception as e:
     print(f'F5-TTS ERROR: {e}')
+    import traceback
+    traceback.print_exc()
 "
 
 echo ""
@@ -129,6 +165,8 @@ try:
     print('Chatterbox DONE')
 except Exception as e:
     print(f'Chatterbox ERROR: {e}')
+    import traceback
+    traceback.print_exc()
 "
 
 echo ""
