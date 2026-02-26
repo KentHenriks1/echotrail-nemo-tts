@@ -6,6 +6,13 @@ Patches: ds_class, _target_, PTL compile check for NeMo compat.
 import os, json
 from pathlib import Path
 
+# Patch PTL 2.6 isinstance check BEFORE any imports
+# Must patch in trainer.py where it's used, not just in compile.py
+import pytorch_lightning.utilities.compile as _ptl_compile
+import pytorch_lightning.trainer.trainer as _ptl_trainer
+_ptl_compile._maybe_unwrap_optimized = lambda model: model
+_ptl_trainer._maybe_unwrap_optimized = lambda model: model
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(SCRIPT_DIR.parent / "data"))).resolve()
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", str(SCRIPT_DIR.parent / "models"))).resolve()
@@ -13,20 +20,6 @@ MANIFEST_DIR = DATA_DIR / "manifests"
 SUP_DATA_DIR = DATA_DIR / "sup_data"
 
 NEW_DS_CLASS = "nemo.collections.tts.data.dataset.TTSDataset"
-
-def patch_ptl_compile_check():
-    """Fix PTL 2.6 isinstance check that fails with NeMo models."""
-    try:
-        import pytorch_lightning.utilities.compile as ptl_compile
-        original = ptl_compile._maybe_unwrap_optimized
-        def patched(model):
-            try:
-                return original(model)
-            except TypeError:
-                return model
-        ptl_compile._maybe_unwrap_optimized = patched
-    except Exception:
-        pass
 
 def main():
     print("Step 4: Fine-tune FastPitch on Norwegian")
@@ -49,8 +42,6 @@ def main():
         from omegaconf import OmegaConf, open_dict
         from nemo.collections.tts.models import FastPitchModel
         from nemo.utils.exp_manager import exp_manager
-
-        patch_ptl_compile_check()
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"  Device: {device}")
