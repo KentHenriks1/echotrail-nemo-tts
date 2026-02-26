@@ -52,8 +52,28 @@ def main():
             cfg.optim.weight_decay = 1e-6
         model.cfg = cfg
         print("Starting training")
-        trainer = pl.Trainer(devices=1, accelerator="gpu" if device == "cuda" else "cpu", max_steps=max_steps, check_val_every_n_epoch=1, log_every_n_steps=50, enable_checkpointing=True, default_root_dir=str(MODEL_DIR / "fastpitch_logs"))
-        exp_cfg = {"exp_dir": str(MODEL_DIR / "fastpitch_logs"), "name": "FastPitch_Norwegian", "create_tensorboard_logger": True, "create_wandb_logger": False, "checkpoint_callback_params": {"monitor": "val_loss", "mode": "min", "save_top_k": 3, "save_last": True}}
+        trainer = pl.Trainer(
+            devices=1,
+            accelerator="gpu" if device == "cuda" else "cpu",
+            max_steps=max_steps,
+            check_val_every_n_epoch=1,
+            log_every_n_steps=50,
+            enable_checkpointing=True,
+            logger=False,
+            default_root_dir=str(MODEL_DIR / "fastpitch_logs"),
+        )
+        exp_cfg = {
+            "exp_dir": str(MODEL_DIR / "fastpitch_logs"),
+            "name": "FastPitch_Norwegian",
+            "create_tensorboard_logger": True,
+            "create_wandb_logger": False,
+            "checkpoint_callback_params": {
+                "monitor": "val_loss",
+                "mode": "min",
+                "save_top_k": 3,
+                "save_last": True,
+            },
+        }
         exp_manager(trainer, OmegaConf.create(exp_cfg))
         trainer.fit(model)
         output_path = MODEL_DIR / "norwegian_fastpitch.nemo"
