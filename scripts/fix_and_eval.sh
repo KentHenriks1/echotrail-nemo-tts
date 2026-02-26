@@ -1,59 +1,45 @@
 #!/bin/bash
-# Fix torchvision conflict and run eval step by step
 set -e
 
 echo "=== Step 1: Fix torchvision ==="
-TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
-echo "PyTorch version: $TORCH_VERSION"
-CUDA_VERSION=$(python3 -c "import torch; print(torch.version.cuda)")
-echo "CUDA version: $CUDA_VERSION"
 pip install --force-reinstall torchvision --index-url https://download.pytorch.org/whl/cu124 2>&1 | tail -3
 
 echo ""
 echo "=== Step 2: Test FastPitch inference ==="
-python3 -c "
-import torch, os, soundfile as sf, time
+python3 << 'PYEOF'
+import torch, os, soundfile as sf, time, glob, tempfile, tarfile
+
 os.makedirs('/workspace/tts_eval', exist_ok=True)
-
-# Load model - handle embedding size mismatch (49 IPA tokens vs 115 default)
-from nemo.collections.tts.models import FastPitchModel, HifiGanModel
-from omegaconf import OmegaConf
-import tempfile, tarfile
-
 nemo_path = '/workspace/echotrail-nemo-tts/models/norwegian_fastpitch.nemo'
 
-# Extract .nemo to get config and weights
+# Extract .nemo archive to get weights
 tmpdir = tempfile.mkdtemp()
 with tarfile.open(nemo_path, 'r:') as tar:
     tar.extractall(tmpdir)
 
-# Find config file
-import glob
-cfg_files = glob.glob(f'{tmpdir}/**/model_config.yaml', recursive=True)
-if not cfg_files:
-    cfg_files = glob.glob(f'{tmpdir}/**/*.yaml', recursive=True)
-print(f'Config files found: {cfg_files}')
-
-# Load config and create model with correct embedding size
-cfg = OmegaConf.load(cfg_files[0])
-
-# Patch the target class for NeMo 2.7 compat
-if hasattr(cfg, 'dataset'):
-    if hasattr(cfg.dataset, '_target_'):
-        cfg.dataset._target_ = 'nemo.collections.tts.data.dataset.TTSDataset'
-
-fp = FastPitchModel(cfg)
-fp.eval().cuda()
-
-# Load state dict
 ckpt_files = glob.glob(f'{tmpdir}/**/model_weights.ckpt', recursive=True)
 if not ckpt_files:
     ckpt_files = glob.glob(f'{tmpdir}/**/*.ckpt', recursive=True)
-print(f'Checkpoint files found: {ckpt_files}')
+print(f'Checkpoint: {ckpt_files}')
+saved_state = torch.load(ckpt_files[0], map_location='cuda')
 
-state_dict = torch.load(ckpt_files[0], map_location='cuda')
-fp.load_state_dict(state_dict, strict=False)
-print(f'Loaded weights. Embedding shape: {fp.fastpitch.encoder.word_emb.weight.shape}')
+# Check actual embedding size from saved weights
+emb_key = 'fastpitch.encoder.word_emb.weight'
+n_tokens = saved_state[emb_key].shape[0]
+emb_dim = saved_state[emb_key].shape[1]
+print(f'Saved embedding: {n_tokens} tokens x {emb_dim} dim')
+
+# Load pretrained English model, then resize and load our weights
+from nemo.collections.tts.models import FastPitchModel, HifiGanModel
+fp = FastPitchModel.from_pretrained("nvidia/tts_en_fastpitch")
+
+# Resize embedding to match our 49 Norwegian IPA tokens
+fp.fastpitch.encoder.word_emb = torch.nn.Embedding(n_tokens, emb_dim, padding_idx=0)
+
+# Load our trained weights
+fp.load_state_dict(saved_state, strict=False)
+fp.eval().cuda()
+print(f'Model loaded! Embedding: {fp.fastpitch.encoder.word_emb.weight.shape}')
 
 # Load HiFi-GAN vocoder
 hg = HifiGanModel.from_pretrained('nvidia/tts_en_hifigan')
@@ -77,20 +63,19 @@ for i, text in enumerate(texts):
     with torch.no_grad():
         spec = fp.generate_spectrogram(tokens=fp.parse(ipa))
         audio = hg.convert_spectrogram_to_audio(spec=spec).squeeze().cpu().numpy()
-    print(f'Time: {time.time()-t0:.3f}s')
+    elapsed = time.time() - t0
     sf.write(f'/workspace/tts_eval/fastpitch_{i+1}.wav', audio, 22050)
-    print(f'Saved: /workspace/tts_eval/fastpitch_{i+1}.wav')
-    print()
+    print(f'Saved: /workspace/tts_eval/fastpitch_{i+1}.wav ({elapsed:.3f}s)\n')
 
 del fp, hg
 torch.cuda.empty_cache()
 print('FastPitch DONE')
-"
+PYEOF
 
 echo ""
 echo "=== Step 3: Install and test F5-TTS ==="
 pip install f5-tts 2>&1 | tail -3
-python3 -c "
+python3 << 'PYEOF'
 import torch, os, soundfile as sf, glob, time
 os.makedirs('/workspace/tts_eval', exist_ok=True)
 
@@ -113,23 +98,21 @@ try:
             print(f'Text: {text}')
             t0 = time.time()
             wav, sr, _ = model.infer(ref_file=ref_audio, ref_text='referanse', gen_text=text)
-            print(f'Time: {time.time()-t0:.3f}s')
+            elapsed = time.time() - t0
             sf.write(f'/workspace/tts_eval/f5tts_{i+1}.wav', wav, sr)
-            print(f'Saved: /workspace/tts_eval/f5tts_{i+1}.wav')
-            print()
+            print(f'Saved: /workspace/tts_eval/f5tts_{i+1}.wav ({elapsed:.3f}s)\n')
     del model
     torch.cuda.empty_cache()
     print('F5-TTS DONE')
 except Exception as e:
     print(f'F5-TTS ERROR: {e}')
-    import traceback
-    traceback.print_exc()
-"
+    import traceback; traceback.print_exc()
+PYEOF
 
 echo ""
 echo "=== Step 4: Install and test Chatterbox ==="
 pip install chatterbox-tts 2>&1 | tail -3
-python3 -c "
+python3 << 'PYEOF'
 import torch, os, time
 os.makedirs('/workspace/tts_eval', exist_ok=True)
 
@@ -156,20 +139,18 @@ try:
         print(f'Text: {text}')
         t0 = time.time()
         wav = model.generate(text, exaggeration=1.0, cfg_weight=0.5, temperature=0.4)
-        print(f'Time: {time.time()-t0:.3f}s')
+        elapsed = time.time() - t0
         ta.save(f'/workspace/tts_eval/chatterbox_{i+1}.wav', wav, model.sr)
-        print(f'Saved: /workspace/tts_eval/chatterbox_{i+1}.wav')
-        print()
+        print(f'Saved: /workspace/tts_eval/chatterbox_{i+1}.wav ({elapsed:.3f}s)\n')
     del model
     torch.cuda.empty_cache()
     print('Chatterbox DONE')
 except Exception as e:
     print(f'Chatterbox ERROR: {e}')
-    import traceback
-    traceback.print_exc()
-"
+    import traceback; traceback.print_exc()
+PYEOF
 
 echo ""
 echo "=== RESULTS ==="
 ls -la /workspace/tts_eval/*.wav 2>/dev/null
-echo "Done! Listen to the WAV files to compare."
+echo "Done! Listen to WAV files to compare."
