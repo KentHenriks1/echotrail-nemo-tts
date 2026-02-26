@@ -1,61 +1,66 @@
 #!/bin/bash
+# Step 1: Download Norwegian speech data from HuggingFace (NbAiLab/NST)
+# Close microphone, Norwegian, 9 shards x ~511MB = ~4.5GB total
+# We download 2 shards (~1GB) for initial training
 set -e
+
 DATA_DIR="${DATA_DIR:-$(cd "$(dirname "$0")/.." && pwd)/data}"
-mkdir -p "$DATA_DIR/nst_synth" "$DATA_DIR/nb_tale"
+mkdir -p "$DATA_DIR/nst"
 
-echo "-- Downloading NST Norwegian Speech Synthesis (sbr-15) --"
-echo "   Single male speaker, 5363 utterances, CC-0"
+echo "== Downloading NST Norwegian Speech (close mic) from HuggingFace =="
+echo "   Source: NbAiLab/NST (Apache 2.0)"
+echo "   Data dir: $DATA_DIR/nst"
 
-NST_URL="https://www.nb.no/sbfil/talesyntese/16kHz_2020/no_16khz.tar.gz"
-NST_TAR="$DATA_DIR/nst_synth/no_16khz.tar.gz"
-
-if [ ! -f "$DATA_DIR/nst_synth/.done" ]; then
-    echo "   Downloading NST Speech Synthesis..."
-    wget -q --show-progress -O "$NST_TAR" "$NST_URL" 2>&1 || {
-        NST_URL_ALT="https://www.nb.no/sbfil/talesyntese/no_16khz.tar.gz"
-        wget -q --show-progress -O "$NST_TAR" "$NST_URL_ALT" 2>&1 || {
-            echo "   FAILED: Manual download from https://www.nb.no/sprakbanken/en/resource-catalogue/oai-nb-no-sbr-15/"
-        }
-    }
-    if [ -f "$NST_TAR" ] && [ -s "$NST_TAR" ]; then
-        echo "   Extracting..."
-        tar -xzf "$NST_TAR" -C "$DATA_DIR/nst_synth/" 2>/dev/null || true
-        touch "$DATA_DIR/nst_synth/.done"
-        echo "   OK: NST Speech Synthesis downloaded"
-    fi
-else
-    echo "   Already downloaded"
-fi
-
+# Download NST TTS metadata from Sprakbanken (single-speaker, 5363 utterances)
 echo ""
-echo "-- Downloading NB Tale (sbr-31) --"
-echo "   380 speakers, 24 dialect areas, ~12 hours"
-
-NB_TALE_URL="https://www.nb.no/sbfil/tale/nb_tale.tar.gz"
-NB_TALE_TAR="$DATA_DIR/nb_tale/nb_tale.tar.gz"
-
-if [ ! -f "$DATA_DIR/nb_tale/.done" ]; then
-    echo "   Downloading NB Tale..."
-    wget -q --show-progress -O "$NB_TALE_TAR" "$NB_TALE_URL" 2>&1 || {
-        NB_TALE_URL_ALT="https://www.nb.no/sbfil/tale/nb_tale.zip"
-        wget -q --show-progress -O "$DATA_DIR/nb_tale/nb_tale.zip" "$NB_TALE_URL_ALT" 2>&1 || {
-            echo "   FAILED: Manual download from https://www.nb.no/sprakbanken/en/resource-catalogue/oai-nb-no-sbr-31/"
-        }
-    }
-    if [ -f "$NB_TALE_TAR" ] && [ -s "$NB_TALE_TAR" ]; then
-        tar -xzf "$NB_TALE_TAR" -C "$DATA_DIR/nb_tale/" 2>/dev/null || true
-        touch "$DATA_DIR/nb_tale/.done"
-        echo "   OK: NB Tale downloaded"
-    elif [ -f "$DATA_DIR/nb_tale/nb_tale.zip" ]; then
-        cd "$DATA_DIR/nb_tale/" && unzip -o nb_tale.zip 2>/dev/null || true
-        touch "$DATA_DIR/nb_tale/.done"
-        echo "   OK: NB Tale downloaded"
-    fi
-else
-    echo "   Already downloaded"
+echo "-- Downloading NST TTS metadata --"
+wget -q --show-progress -O "$DATA_DIR/nst/nst_tts_dataset.jsonl" \
+  "https://www.nb.no/sbfil/talesyntese/nst_tts_dataset.jsonl" 2>&1 || true
+if [ -f "$DATA_DIR/nst/nst_tts_dataset.jsonl" ]; then
+    echo "   OK: $(wc -l < "$DATA_DIR/nst/nst_tts_dataset.jsonl") entries"
 fi
+
+# Download close-mic shards from HuggingFace
+SHARDS_TO_DOWNLOAD=2
+BASE_URL="https://huggingface.co/datasets/NbAiLab/NST/resolve/main/data/train"
+
+for i in $(seq -w 1 $SHARDS_TO_DOWNLOAD); do
+    SHARD="nst_no_train_close-000${i}-of-0009"
+
+    if [ ! -f "$DATA_DIR/nst/${SHARD}.tar.gz" ]; then
+        echo ""
+        echo "-- Downloading shard $i/$SHARDS_TO_DOWNLOAD: ${SHARD}.tar.gz (~511MB) --"
+        wget -q --show-progress -O "$DATA_DIR/nst/${SHARD}.tar.gz" \
+          "${BASE_URL}/${SHARD}.tar.gz?download=true" 2>&1
+        echo "   OK: $(du -h "$DATA_DIR/nst/${SHARD}.tar.gz" | cut -f1)"
+    else
+        echo "   Shard $i already downloaded"
+    fi
+
+    if [ ! -f "$DATA_DIR/nst/${SHARD}.json" ]; then
+        echo "   Downloading metadata: ${SHARD}.json"
+        wget -q --show-progress -O "$DATA_DIR/nst/${SHARD}.json" \
+          "${BASE_URL}/${SHARD}.json?download=true" 2>&1
+    fi
+done
+
+# Extract audio shards
+echo ""
+echo "-- Extracting audio files --"
+for i in $(seq -w 1 $SHARDS_TO_DOWNLOAD); do
+    SHARD="nst_no_train_close-000${i}-of-0009"
+    if [ -f "$DATA_DIR/nst/${SHARD}.tar.gz" ] && [ ! -f "$DATA_DIR/nst/.extracted_${i}" ]; then
+        echo "   Extracting shard $i..."
+        tar -xzf "$DATA_DIR/nst/${SHARD}.tar.gz" -C "$DATA_DIR/nst/" 2>/dev/null || true
+        touch "$DATA_DIR/nst/.extracted_${i}"
+        echo "   OK"
+    fi
+done
 
 echo ""
 echo "-- Data inventory --"
-echo "   NST Synth: $(find $DATA_DIR/nst_synth -name '*.wav' 2>/dev/null | wc -l) WAV files"
-echo "   NB Tale:   $(find $DATA_DIR/nb_tale -name '*.wav' 2>/dev/null | wc -l) WAV files"
+AUDIO_COUNT=$(find "$DATA_DIR/nst" -name '*.mp3' -o -name '*.wav' 2>/dev/null | wc -l)
+JSON_COUNT=$(find "$DATA_DIR/nst" -name '*.json' 2>/dev/null | wc -l)
+echo "   Audio files: $AUDIO_COUNT"
+echo "   JSON metadata files: $JSON_COUNT"
+echo "   Total size: $(du -sh "$DATA_DIR/nst" | cut -f1)"
