@@ -2,11 +2,11 @@
 """
 Step 4: Fine-tune FastPitch on Norwegian using NeMo 2.7.
 Uses pre-processed IPA manifests (from step 03).
-Optimized for H100 80GB: batch_size=64, num_workers=8, bf16-mixed.
+Maxes out CPU+GPU: 32 workers, prefetch, bf16, batch=64.
+Epoch 0 caches sup_data, epoch 1+ runs at full GPU speed.
 """
 import os, json
 from pathlib import Path
-from typing import List
 
 os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = "/usr/lib/x86_64-linux-gnu/libespeak-ng.so"
 os.environ["LD_LIBRARY_PATH"] = "/usr/lib/x86_64-linux-gnu:" + os.environ.get("LD_LIBRARY_PATH", "")
@@ -29,7 +29,6 @@ def build_vocab_from_manifest(manifest_path):
 
 def create_tokenizer(vocab):
     from nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers import BaseTokenizer
-
     class IPACharTokenizer(BaseTokenizer):
         def __init__(self, vocab_list):
             self.pad, self.blank, self.oov = 0, 1, 2
@@ -39,13 +38,10 @@ def create_tokenizer(vocab):
             self.vocab_size = len(vocab_list)
             self.phoneme_probability = None
             self.text_preprocessing_func = lambda x: x.strip()
-
         def encode(self, text):
             return [self._token2id.get(c, self.oov) for c in self.text_preprocessing_func(text)]
-
         def decode(self, ids):
             return "".join(self._id2token.get(i, "?") for i in ids)
-
     return IPACharTokenizer(vocab)
 
 
@@ -63,11 +59,10 @@ def resize_embeddings(model, new_vocab_size):
     with open_dict(model.cfg):
         model.cfg.symbols_embedding_dim = dim
         model.cfg.n_symbols = new_vocab_size
-    print(f"  Embedding resized OK")
 
 
 def main():
-    print("Step 4: Fine-tune FastPitch on Norwegian (IPA) — H100 optimized")
+    print("Step 4: FastPitch Norwegian (IPA) — max throughput")
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     SUP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -93,42 +88,24 @@ def main():
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9 if device == "cuda" else 0
-        print(f"  Device: {device} ({gpu_mem:.0f} GB)")
+        n_cpus = os.cpu_count() or 8
+        # Use many workers but cap at reasonable level
+        workers = min(32, max(8, n_cpus // 4))
+        batch_size = 64 if gpu_mem >= 70 else (32 if gpu_mem >= 30 else 16)
+        val_batch = batch_size // 2
+        print(f"  Device: {device} ({gpu_mem:.0f} GB), CPUs: {n_cpus}, workers: {workers}, batch: {batch_size}")
 
-        # Determine optimal batch size for GPU
-        if gpu_mem >= 70:
-            batch_size = 64
-            val_batch = 32
-            workers = 8
-        elif gpu_mem >= 30:
-            batch_size = 32
-            val_batch = 16
-            workers = 4
-        else:
-            batch_size = 16
-            val_batch = 8
-            workers = 2
-        print(f"  Batch size: {batch_size}, workers: {workers}")
-
-        # 1. Build vocab
-        print("Building IPA vocabulary")
         vocab = build_vocab_from_manifest(str(train_manifest))
         tokenizer = create_tokenizer(vocab)
         print(f"  Vocab: {tokenizer.vocab_size} tokens")
 
-        # 2. Load model
         print("Loading pretrained FastPitch")
         model = FastPitchModel.from_pretrained("tts_en_fastpitch")
-
-        # 3. Patch for Norwegian
-        print("Patching model for Norwegian IPA")
         model.vocab = tokenizer
         model.ds_class = NEW_DS_CLASS
         resize_embeddings(model, tokenizer.vocab_size)
 
-        abs_train = str(train_manifest)
-        abs_val = str(val_manifest)
-        abs_sup = str(SUP_DATA_DIR)
+        abs_train, abs_val, abs_sup = str(train_manifest), str(val_manifest), str(SUP_DATA_DIR)
 
         with open_dict(model.cfg):
             model.cfg.train_ds.dataset._target_ = NEW_DS_CLASS
@@ -141,25 +118,26 @@ def main():
             model.cfg.validation_ds.manifest_filepath = abs_val
             model.cfg.train_ds.batch_size = batch_size
             model.cfg.validation_ds.batch_size = val_batch
+            # Max CPU utilization: many workers + prefetch
             model.cfg.train_ds.dataloader_params.num_workers = workers
             model.cfg.train_ds.dataloader_params.pin_memory = True
             model.cfg.train_ds.dataloader_params.persistent_workers = True
+            model.cfg.train_ds.dataloader_params.prefetch_factor = 4
             model.cfg.validation_ds.dataloader_params.num_workers = workers
             model.cfg.validation_ds.dataloader_params.pin_memory = True
             model.cfg.validation_ds.dataloader_params.persistent_workers = True
+            model.cfg.validation_ds.dataloader_params.prefetch_factor = 4
             model.cfg.sup_data_path = abs_sup
             model.cfg.sup_data_types = ["align_prior_matrix", "pitch"]
             model.cfg.optim.lr = 2e-4
             model.cfg.optim.name = "adam"
             model.cfg.optim.weight_decay = 1e-6
 
-        # 4. Setup data
         print("Setup data loaders")
         model.setup_training_data(model.cfg.train_ds)
         model.setup_validation_data(model.cfg.validation_ds)
 
-        # 5. Train
-        print(f"Training ({max_steps} steps, batch={batch_size}, bf16)")
+        print(f"Training ({max_steps} steps, batch={batch_size}, bf16, workers={workers})")
         trainer = pl.Trainer(
             devices=1,
             accelerator="gpu" if device == "cuda" else "cpu",
@@ -185,7 +163,6 @@ def main():
         model.set_trainer(trainer)
         trainer.fit(model)
 
-        # 6. Save
         output_path = MODEL_DIR / "norwegian_fastpitch.nemo"
         model.save_to(str(output_path))
         print(f"Saved: {output_path} ({output_path.stat().st_size/1024/1024:.1f} MB)")
