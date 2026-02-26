@@ -8,6 +8,13 @@ import os, json, string
 from pathlib import Path
 from typing import List, Optional
 
+# Ensure espeak library is findable by phonemizer in all subprocesses
+os.environ["LD_LIBRARY_PATH"] = "/usr/lib/x86_64-linux-gnu:" + os.environ.get("LD_LIBRARY_PATH", "")
+# Also set PHONEMIZER_ESPEAK_LIBRARY directly
+_espeak_lib = "/usr/lib/x86_64-linux-gnu/libespeak-ng.so"
+if os.path.exists(_espeak_lib):
+    os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = _espeak_lib
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(SCRIPT_DIR.parent / "data"))).resolve()
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", str(SCRIPT_DIR.parent / "models"))).resolve()
@@ -154,8 +161,9 @@ def main():
             model.cfg.validation_ds.manifest_filepath = abs_val
             model.cfg.train_ds.batch_size = 16
             model.cfg.validation_ds.batch_size = 8
-            model.cfg.train_ds.dataloader_params.num_workers = 4
-            model.cfg.validation_ds.dataloader_params.num_workers = 2
+            # Use num_workers=0 to avoid subprocess espeak library issues
+            model.cfg.train_ds.dataloader_params.num_workers = 0
+            model.cfg.validation_ds.dataloader_params.num_workers = 0
             model.cfg.sup_data_path = abs_sup
             model.cfg.sup_data_types = ["align_prior_matrix", "pitch"]
             model.cfg.optim.lr = 1e-4
